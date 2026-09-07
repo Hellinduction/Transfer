@@ -14,10 +14,11 @@ default port is 5812, port forward that on your router
 files get saved to ./received/<code>/
 
 
-SENDING FILES
-=============
+-------------------------------------------------------------------
+SENDING FILES - LINUX
+-------------------------------------------------------------------
 
-grab the transfer client, then:
+grab transfer (linux client), then:
 
   chmod +x ./transfer
   ./transfer <server_ip> 5812 <code> <folder or file>
@@ -25,7 +26,28 @@ grab the transfer client, then:
 example:
   ./transfer 1.2.3.4 5812 mycode ./world
 
-flags if u need em:
+supports TLS automatically on port 443, or use --tls to force it
+
+
+-------------------------------------------------------------------
+SENDING FILES - WINDOWS
+-------------------------------------------------------------------
+
+grab transfer.exe (no TLS) or transfer_tls.exe (TLS / port 443)
+
+  transfer.exe <server_ip> 5812 <code> <folder or file>
+  transfer_tls.exe <server_ip> 443 <code> <folder or file>
+
+example:
+  transfer.exe 1.2.3.4 5812 mycode world
+
+transfer_tls.exe supports TLS automatically on port 443, or use --tls
+
+
+-------------------------------------------------------------------
+FLAGS (all clients)
+-------------------------------------------------------------------
+
   --nr          dont go into subfolders
   --nj          skip jar files
   --ignore xyz  skip anything with xyz in the name
