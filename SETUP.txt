@@ -1,0 +1,31 @@
+SETUP
+=====
+
+grab transfer_server (linux) or transfer_server.exe (windows) and run it
+
+linux:
+  chmod +x transfer_server
+  ./transfer_server
+
+windows:
+  just double click transfer_server.exe or run it in cmd
+
+default port is 5812, port forward that on your router
+files get saved to ./received/<code>/
+
+
+SENDING FILES
+=============
+
+grab the transfer client, then:
+
+  chmod +x ./transfer
+  ./transfer <server_ip> 5812 <code> <folder or file>
+
+example:
+  ./transfer 1.2.3.4 5812 mycode ./world
+
+flags if u need em:
+  --nr          dont go into subfolders
+  --nj          skip jar files
+  --ignore xyz  skip anything with xyz in the name
