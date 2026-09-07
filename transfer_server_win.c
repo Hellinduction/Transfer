@@ -335,9 +335,9 @@ static DWORD WINAPI handle_client(LPVOID param) {
         if (_isatty(_fileno(stdout))) {
             EnterCriticalSection(&g_log_cs);
             if (total_expected)
-                printf("\r\033[K  [%d/%u] %s", files_ok + files_err + 1, total_expected, relpath);
+                printf("\r\033[K  [%d/%u] %.70s", files_ok + files_err + 1, total_expected, relpath);
             else
-                printf("\r\033[K  [%d] %s", files_ok + files_err + 1, relpath);
+                printf("\r\033[K  [%d] %.70s", files_ok + files_err + 1, relpath);
             fflush(stdout);
             g_progress_line = 1;
             LeaveCriticalSection(&g_log_cs);

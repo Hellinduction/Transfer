@@ -333,9 +333,9 @@ static void *handle_client(void *arg) {
         if (isatty(STDOUT_FILENO)) {
             pthread_mutex_lock(&g_log_mu);
             if (total_expected)
-                printf("\r\033[K  [%d/%u] %s", files_ok + files_err + 1, total_expected, relpath);
+                printf("\r\033[K  [%d/%u] %.70s", files_ok + files_err + 1, total_expected, relpath);
             else
-                printf("\r\033[K  [%d] %s", files_ok + files_err + 1, relpath);
+                printf("\r\033[K  [%d] %.70s", files_ok + files_err + 1, relpath);
             fflush(stdout);
             g_progress_line = 1;
             pthread_mutex_unlock(&g_log_mu);
