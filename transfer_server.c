@@ -220,14 +220,36 @@ typedef struct { int fd; struct sockaddr_in addr; } Client;
 static void *handle_client(void *arg) {
     Client *c = (Client*)arg;
     int fd    = c->fd;
-    char remote[INET_ADDRSTRLEN];
+    char remote[64];
     inet_ntop(AF_INET, &c->addr.sin_addr, remote, sizeof(remote));
     free(c);
 
-    /* Magic header check — drop crawlers silently */
+    /* Detect PROXY protocol header (nginx) or direct TRFS magic.
+     * PROXY header starts with "PROX"; TRFS magic starts with 0x54.
+     * Both paths end with the 4-byte TRFS magic having been consumed. */
     {
-        uint8_t magic[4], expected[4] = {0x54, 0x52, 0x46, 0x53};
-        if (recv_all(fd, magic, 4) < 0 || memcmp(magic, expected, 4) != 0) {
+        uint8_t first4[4];
+        if (recv_all(fd, first4, 4) < 0) { close(fd); return NULL; }
+        uint8_t expected[4] = {0x54, 0x52, 0x46, 0x53};
+        if (memcmp(first4, "PROX", 4) == 0) {
+            /* Read rest of PROXY protocol line to extract real client IP */
+            char line[256]; int li = 4;
+            memcpy(line, first4, 4);
+            char ch;
+            while (li < (int)sizeof(line)-1 && recv(fd, &ch, 1, 0) == 1) {
+                line[li++] = ch;
+                if (ch == '\n') break;
+            }
+            line[li] = '\0';
+            char proto[16], src_ip[64], dst_ip[64]; int sp, dp;
+            if (sscanf(line, "PROXY %15s %63s %63s %d %d",
+                       proto, src_ip, dst_ip, &sp, &dp) >= 3
+                    && strcmp(proto, "UNKNOWN") != 0)
+                strncpy(remote, src_ip, sizeof(remote)-1);
+            if (recv_all(fd, first4, 4) < 0 || memcmp(first4, expected, 4) != 0) {
+                close(fd); return NULL;
+            }
+        } else if (memcmp(first4, expected, 4) != 0) {
             close(fd); return NULL;
         }
     }

@@ -224,14 +224,33 @@ typedef struct { SOCKET sock; struct sockaddr_in addr; } Client;
 static DWORD WINAPI handle_client(LPVOID param) {
     Client *c = (Client*)param;
     SOCKET s  = c->sock;
-    char remote[INET6_ADDRSTRLEN];
+    char remote[64];
     inet_ntop(AF_INET, &c->addr.sin_addr, remote, sizeof(remote));
     free(c);
 
-    /* Magic header check — drop crawlers silently */
+    /* Detect PROXY protocol header (nginx) or direct TRFS magic */
     {
-        uint8_t magic[4], expected[4] = {0x54, 0x52, 0x46, 0x53};
-        if (recv_all(s, magic, 4) < 0 || memcmp(magic, expected, 4) != 0) {
+        uint8_t first4[4];
+        if (recv_all(s, first4, 4) < 0) { closesocket(s); return 0; }
+        uint8_t expected[4] = {0x54, 0x52, 0x46, 0x53};
+        if (memcmp(first4, "PROX", 4) == 0) {
+            char line[256]; int li = 4;
+            memcpy(line, first4, 4);
+            char ch;
+            while (li < (int)sizeof(line)-1 && recv(s, &ch, 1, 0) == 1) {
+                line[li++] = ch;
+                if (ch == '\n') break;
+            }
+            line[li] = '\0';
+            char proto[16], src_ip[64], dst_ip[64]; int sp, dp;
+            if (sscanf(line, "PROXY %15s %63s %63s %d %d",
+                       proto, src_ip, dst_ip, &sp, &dp) >= 3
+                    && strcmp(proto, "UNKNOWN") != 0)
+                strncpy(remote, src_ip, sizeof(remote)-1);
+            if (recv_all(s, first4, 4) < 0 || memcmp(first4, expected, 4) != 0) {
+                closesocket(s); return 0;
+            }
+        } else if (memcmp(first4, expected, 4) != 0) {
             closesocket(s); return 0;
         }
     }
