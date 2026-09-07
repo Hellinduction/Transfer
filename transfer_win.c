@@ -1,8 +1,11 @@
 /*
  * transfer_win.c — Windows file-transfer client
  *
- * Cross-compile from WSL:
+ * Compile (no TLS, from WSL):
  *   x86_64-w64-mingw32-gcc transfer_win.c -o transfer.exe -lws2_32 -lz -static
+ *
+ * Compile (with TLS, from WSL):
+ *   x86_64-w64-mingw32-gcc transfer_win.c -o transfer.exe -DHAVE_TLS -lws2_32 -lz -lssl -lcrypto -static
  *
  * Usage:
  *   transfer.exe <server_ip> <server_port> [flags] <code> <file/folder>
@@ -10,6 +13,7 @@
  * Flags:
  *   --nr               non-recursive (top-level files only)
  *   --nj               skip .jar files
+ *   --tls              force TLS (auto-enabled on port 443)
  *   --ignore <word>    skip files/folders whose name contains <word> (repeatable)
  */
 
@@ -23,6 +27,10 @@
 #include <string.h>
 #include <stdint.h>
 #include <zlib.h>
+#ifdef HAVE_TLS
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#endif
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -40,9 +48,15 @@ static int               g_skipped = 0;
 static int               g_errors  = 0;
 static int               g_tty     = 0;
 static int               g_aborted = 0;
+static int               g_use_tls = 0;
 
 static const char **g_ignores  = NULL;
 static int          g_nignores = 0;
+
+#ifdef HAVE_TLS
+static SSL_CTX *g_ssl_ctx = NULL;
+static SSL     *g_ssl     = NULL;
+#endif
 
 /* ── manifest ─────────────────────────────────────────────────────────── */
 
@@ -66,7 +80,12 @@ static int is_ignored(const char *name) {
 static int send_all(SOCKET s, const void *buf, int n) {
     int sent = 0;
     while (sent < n) {
-        int r = send(s, (const char*)buf + sent, n - sent, 0);
+        int r;
+#ifdef HAVE_TLS
+        if (g_ssl) r = SSL_write(g_ssl, (const char*)buf + sent, n - sent);
+        else
+#endif
+        r = send(s, (const char*)buf + sent, n - sent, 0);
         if (r <= 0) return -1;
         sent += r;
     }
@@ -76,7 +95,12 @@ static int send_all(SOCKET s, const void *buf, int n) {
 static int recv_all(SOCKET s, void *buf, int n) {
     int got = 0;
     while (got < n) {
-        int r = recv(s, (char*)buf + got, n - got, 0);
+        int r;
+#ifdef HAVE_TLS
+        if (g_ssl) r = SSL_read(g_ssl, (char*)buf + got, n - got);
+        else
+#endif
+        r = recv(s, (char*)buf + got, n - got, 0);
         if (r <= 0) return -1;
         got += r;
     }
@@ -182,21 +206,59 @@ static SOCKET connect_to_server(void) {
     }
     nb = 0; ioctlsocket(sock, FIONBIO, &nb);
 
-    /* on Windows SO_RCVTIMEO/SO_SNDTIMEO take DWORD milliseconds */
     DWORD tms = 30000;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&tms, sizeof(tms));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&tms, sizeof(tms));
 
+#ifdef HAVE_TLS
+    if (g_use_tls) {
+        g_ssl_ctx = SSL_CTX_new(TLS_client_method());
+        if (!g_ssl_ctx) { fprintf(stderr, "SSL_CTX_new failed\n"); closesocket(sock); return INVALID_SOCKET; }
+        SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
+        g_ssl = SSL_new(g_ssl_ctx);
+        SSL_set_fd(g_ssl, (int)sock);
+        SSL_set_tlsext_host_name(g_ssl, g_server_ip);
+        if (SSL_connect(g_ssl) <= 0) {
+            fprintf(stderr, "TLS handshake failed\n");
+            SSL_free(g_ssl); g_ssl = NULL;
+            SSL_CTX_free(g_ssl_ctx); g_ssl_ctx = NULL;
+            closesocket(sock); return INVALID_SOCKET;
+        }
+    }
+#endif
+
     uint8_t magic[4] = {0x54, 0x52, 0x46, 0x53};
-    send(sock, (char*)magic, 4, 0);
+    send_all(sock, magic, 4);
     char code_buf[256]; snprintf(code_buf, sizeof(code_buf), "%s\n", g_code);
-    send(sock, code_buf, (int)strlen(code_buf), 0);
-    char confirm = 0; recv(sock, &confirm, 1, 0);
+    send_all(sock, code_buf, (int)strlen(code_buf));
+    char confirm = 0; recv_all(sock, &confirm, 1);
     if (confirm != 'l') {
         fprintf(stderr, "Bad confirmation: 0x%02x\n", (unsigned char)confirm);
         closesocket(sock); return INVALID_SOCKET;
     }
     return sock;
+}
+
+/* ── count files (quick pass before transfer) ────────────────────────── */
+
+static uint32_t count_dir_win(const char *dir, int nr, int nj) {
+    char pattern[4096]; snprintf(pattern, sizeof(pattern), "%s\\*", dir);
+    WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    uint32_t n = 0;
+    do {
+        if (!strcmp(fd.cFileName,".") || !strcmp(fd.cFileName,"..")) continue;
+        if (is_ignored(fd.cFileName)) continue;
+        if (nj) { size_t nl=strlen(fd.cFileName); if (nl>=4 && !_stricmp(fd.cFileName+nl-4,".jar")) continue; }
+        char full[4096]; snprintf(full, sizeof(full), "%s\\%s", dir, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (!nr) n += count_dir_win(full, 0, nj);
+        } else {
+            n++;
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return n;
 }
 
 /* ── send one file ───────────────────────────────────────────────────── */
@@ -314,6 +376,7 @@ static void usage(const char *prog) {
         "\n"
         "  --nr               non-recursive\n"
         "  --nj               skip .jar files\n"
+        "  --tls              force TLS (auto on port 443)\n"
         "  --ignore <word>    skip files/dirs whose name contains <word> (repeatable)\n"
         "\n"
         "Example:\n"
@@ -338,6 +401,7 @@ int main(int argc, char *argv[]) {
     if (g_server_port <= 0 || g_server_port > 65535) {
         fprintf(stderr, "Invalid port: %s\n", argv[2]); return 1;
     }
+    if (g_server_port == 443) g_use_tls = 1;
 
     int nr = 0, nj = 0;
     char **clean = malloc((size_t)argc * sizeof(char*)); int nc = 0;
@@ -346,6 +410,7 @@ int main(int argc, char *argv[]) {
     for (int i = 3; i < argc; i++) {
         if      (!strcmp(argv[i],"--nr") || !strcmp(argv[i],"-nr"))   nr = 1;
         else if (!strcmp(argv[i],"--nj") || !strcmp(argv[i],"-nj"))   nj = 1;
+        else if (!strcmp(argv[i],"--tls")|| !strcmp(argv[i],"-tls"))  g_use_tls = 1;
         else if ((!strcmp(argv[i],"--ignore")||!strcmp(argv[i],"-ignore")) && i+1<argc)
             g_ignores[g_nignores++] = argv[++i];
         else if (!strcmp(argv[i],"--zip") || !strcmp(argv[i],"-zip")) ;
@@ -353,6 +418,13 @@ int main(int argc, char *argv[]) {
     }
     if (nc < 2) { usage(argv[0]); free(clean); return 1; }
     g_code = clean[0]; const char *path = clean[1]; free(clean);
+
+#ifndef HAVE_TLS
+    if (g_use_tls) {
+        fprintf(stderr, "TLS not compiled in — rebuild with -DHAVE_TLS\n");
+        return 1;
+    }
+#endif
 
     g_tty = _isatty(_fileno(stdout));
 
@@ -365,6 +437,13 @@ int main(int argc, char *argv[]) {
     if (g_sock == INVALID_SOCKET) { WSACleanup(); return 1; }
 
     read_manifest();
+
+    /* send 0x02 metadata packet with total file count */
+    {
+        uint32_t total = (attr & FILE_ATTRIBUTE_DIRECTORY) ? count_dir_win(path, nr, nj) : 1;
+        uint8_t meta[5]; meta[0] = 0x02; write_be32(meta+1, total);
+        send_all(g_sock, meta, 5);
+    }
 
     printf("Connected (code: %s)\n", g_code);
 
@@ -386,6 +465,10 @@ int main(int argc, char *argv[]) {
 
     uint8_t term = 0xFF;
     send_all(g_sock, &term, 1);
+#ifdef HAVE_TLS
+    if (g_ssl) { SSL_shutdown(g_ssl); SSL_free(g_ssl); }
+    if (g_ssl_ctx) SSL_CTX_free(g_ssl_ctx);
+#endif
     closesocket(g_sock);
     printf("%sDone: %d sent, %d skipped, %d failed.\n",
            g_tty ? "\n" : "", g_sent, g_skipped, g_errors);

@@ -65,6 +65,23 @@ docker run --rm -v "${PWD}:/src" alpine sh -c \
 ```bash
 x86_64-w64-mingw32-gcc transfer_server_win.c -o transfer_server.exe -lws2_32 -lz -static
 ```
+**Windows client (from WSL, no TLS):**
+```bash
+x86_64-w64-mingw32-gcc transfer_win.c -o transfer.exe -lws2_32 -lz -static
+```
+**Windows client (with TLS, from WSL — requires OpenSSL built for MinGW):**
+```bash
+# Build OpenSSL for MinGW once:
+wget https://github.com/openssl/openssl/releases/download/openssl-3.3.2/openssl-3.3.2.tar.gz
+tar xf openssl-3.3.2.tar.gz && cd openssl-3.3.2
+./Configure mingw64 --cross-compile-prefix=x86_64-w64-mingw32- --prefix=/tmp/ssl no-shared no-tests
+make -j4 && make install_sw
+
+# Then compile:
+x86_64-w64-mingw32-gcc transfer_win.c -o transfer_tls.exe -DHAVE_TLS \
+  -I/tmp/ssl/include -L/tmp/ssl/lib64 \
+  -Wl,--start-group -lssl -lcrypto -lz -lgdi32 -lcrypt32 -lws2_32 -Wl,--end-group -static
+```
 **Linux client (with TLS):**
 ```bash
 docker run --rm -v "${PWD}:/src" alpine sh -c \

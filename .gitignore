@@ -1,0 +1,7 @@
+transfer_server
+transfer_server.exe
+transfer
+transfer.exe
+transfer_tls.exe
+*.o
+received/
