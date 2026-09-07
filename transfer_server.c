@@ -291,6 +291,7 @@ static void *handle_client(void *arg) {
     /* 4. Receive files in a loop until terminator (flags == 0xFF) */
     uint8_t *in_buf  = (uint8_t*)malloc(CHUNK_COMP);
     uint8_t *out_buf = (uint8_t*)malloc(CHUNK_RAW);
+    if (!in_buf || !out_buf) { free(in_buf); free(out_buf); close(fd); return NULL; }
 #define MAX_FILE_BYTES (50ULL * 1024 * 1024 * 1024)
 
     int files_ok = 0, files_err = 0;
@@ -375,14 +376,13 @@ static void *handle_client(void *arg) {
             if (flags & 0x01) {
                 uint32_t cl;
                 while ((cl = read_be32(fd)) > 0) {
-                    uint8_t tmp2[CHUNK_COMP];
-                    if (cl > CHUNK_COMP || recv_all(fd, tmp2, cl) < 0) goto done;
+                    if (cl > CHUNK_COMP || recv_all(fd, in_buf, cl) < 0) goto done;
                 }
             } else {
-                uint8_t tmp2[BUF_SIZE]; uint64_t rem = orig_len;
+                uint64_t rem = orig_len;
                 while (rem > 0) {
                     size_t want = rem > BUF_SIZE ? BUF_SIZE : (size_t)rem;
-                    ssize_t r = recv(fd, tmp2, want, 0);
+                    ssize_t r = recv(fd, in_buf, want, 0);
                     if (r <= 0) goto done;
                     rem -= (uint64_t)r;
                 }

@@ -292,6 +292,7 @@ static DWORD WINAPI handle_client(LPVOID param) {
     /* 4. Receive files in a loop until terminator (flags == 0xFF) */
     uint8_t *in_buf  = (uint8_t*)malloc(CHUNK_COMP);
     uint8_t *out_buf = (uint8_t*)malloc(CHUNK_RAW);
+    if (!in_buf || !out_buf) { free(in_buf); free(out_buf); closesocket(s); return 0; }
 #define MAX_FILE_BYTES (50ULL * 1024 * 1024 * 1024)
 
     int files_ok = 0, files_err = 0;
