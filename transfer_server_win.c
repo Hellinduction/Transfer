@@ -142,22 +142,24 @@ static uint32_t file_crc32_win(const char *path) {
     return crc;
 }
 
-typedef struct { MEntry *entries; int count; int cap; } ManifestBuf;
-
-static void me_add(ManifestBuf *m, const char *rel, uint64_t sz, uint32_t crc) {
-    if (m->count >= m->cap) {
-        int new_cap = m->cap ? m->cap*2 : 64;
-        MEntry *tmp = realloc(m->entries, (size_t)new_cap * sizeof(MEntry));
-        if (!tmp) return;
-        m->entries = tmp; m->cap = new_cap;
-    }
-    strncpy(m->entries[m->count].path, rel, 1023); m->entries[m->count].path[1023] = '\0';
-    m->entries[m->count].size  = sz;
-    m->entries[m->count].crc32 = crc;
-    m->count++;
+/* Pass 1: count files only (no CRC32 — fast, just FindFirstFile) */
+static uint32_t count_manifest_win(const char *dir) {
+    char pattern[4096]; snprintf(pattern, sizeof(pattern), "%s\\*", dir);
+    WIN32_FIND_DATAA fd2; HANDLE h = FindFirstFileA(pattern, &fd2);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    uint32_t n = 0;
+    do {
+        if (!strcmp(fd2.cFileName,".") || !strcmp(fd2.cFileName,"..")) continue;
+        char full[4096]; snprintf(full, sizeof(full), "%s\\%s", dir, fd2.cFileName);
+        if (fd2.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) n += count_manifest_win(full);
+        else n++;
+    } while (FindNextFileA(h, &fd2));
+    FindClose(h);
+    return n;
 }
 
-static void manifest_walk_win(const char *dir, size_t root_len, ManifestBuf *m) {
+/* Pass 2: walk + CRC32 + send each entry immediately so data flows continuously */
+static void stream_manifest_win(SOCKET s, const char *dir, size_t root_len) {
     char pattern[4096]; snprintf(pattern, sizeof(pattern), "%s\\*", dir);
     WIN32_FIND_DATAA fd2; HANDLE h = FindFirstFileA(pattern, &fd2);
     if (h == INVALID_HANDLE_VALUE) return;
@@ -165,49 +167,48 @@ static void manifest_walk_win(const char *dir, size_t root_len, ManifestBuf *m) 
         if (!strcmp(fd2.cFileName,".") || !strcmp(fd2.cFileName,"..")) continue;
         char full[4096]; snprintf(full, sizeof(full), "%s\\%s", dir, fd2.cFileName);
         if (fd2.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            manifest_walk_win(full, root_len, m);
+            stream_manifest_win(s, full, root_len);
         } else {
             const char *rel = full + root_len; while (*rel=='\\' || *rel=='/') rel++;
             uint64_t sz = ((uint64_t)fd2.nFileSizeHigh<<32)|fd2.nFileSizeLow;
-            /* normalize to forward slashes so client strcmp works */
             char norm[1024]; strncpy(norm, rel, 1023); norm[1023] = '\0';
             for (char *p = norm; *p; p++) if (*p == '\\') *p = '/';
-            me_add(m, norm, sz, file_crc32_win(full));
+            uint32_t nl = (uint32_t)strlen(norm);
+            uint32_t crc = file_crc32_win(full);
+            uint8_t hdr[4];
+            hdr[0]=(uint8_t)(nl>>24); hdr[1]=(uint8_t)(nl>>16); hdr[2]=(uint8_t)(nl>>8); hdr[3]=(uint8_t)nl;
+            send(s, (char*)hdr, 4, 0);
+            send(s, norm, (int)nl, 0);
+            uint8_t tail[12];
+            for (int j=7;j>=0;j--) { tail[j]=(uint8_t)(sz&0xFF); sz>>=8; }
+            tail[8]=(uint8_t)(crc>>24); tail[9]=(uint8_t)(crc>>16); tail[10]=(uint8_t)(crc>>8); tail[11]=(uint8_t)crc;
+            send(s, (char*)tail, 12, 0);
         }
     } while (FindNextFileA(h, &fd2));
     FindClose(h);
 }
 
 static void send_manifest_win(SOCKET s, const char *code_dir) {
-    ManifestBuf m = {NULL, 0, 0};
     DWORD attr = GetFileAttributesA(code_dir);
-    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
-        manifest_walk_win(code_dir, strlen(code_dir), &m);
+    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        uint8_t cb[4] = {0,0,0,0}; send(s, (char*)cb, 4, 0);
+        return;
+    }
+    uint32_t count = count_manifest_win(code_dir);
+    uint8_t cb[4];
+    cb[0]=(uint8_t)(count>>24); cb[1]=(uint8_t)(count>>16); cb[2]=(uint8_t)(count>>8); cb[3]=(uint8_t)count;
+    send(s, (char*)cb, 4, 0);
+    if (count > 0) {
+        size_t root_len = strlen(code_dir);
+        stream_manifest_win(s, code_dir, root_len);
         if (_isatty(_fileno(stdout))) {
             EnterCriticalSection(&g_log_cs);
             if (g_progress_line) { printf("\n"); g_progress_line = 0; }
-            printf("  Built manifest: %d files\n", m.count);
+            printf("  Sent manifest: %u files\n", count);
             fflush(stdout);
             LeaveCriticalSection(&g_log_cs);
         }
     }
-    uint8_t cb[4];
-    cb[0]=(uint8_t)(m.count>>24); cb[1]=(uint8_t)(m.count>>16); cb[2]=(uint8_t)(m.count>>8); cb[3]=(uint8_t)m.count;
-    send(s, (char*)cb, 4, 0);
-    for (int i = 0; i < m.count; i++) {
-        uint32_t nl = (uint32_t)strlen(m.entries[i].path);
-        uint8_t hdr[4];
-        hdr[0]=(uint8_t)(nl>>24); hdr[1]=(uint8_t)(nl>>16); hdr[2]=(uint8_t)(nl>>8); hdr[3]=(uint8_t)nl;
-        send(s, (char*)hdr, 4, 0);
-        send(s, m.entries[i].path, (int)nl, 0);
-        uint8_t tail[12];
-        uint64_t sz = m.entries[i].size;
-        for (int j=7;j>=0;j--) { tail[j]=(uint8_t)(sz&0xFF); sz>>=8; }
-        uint32_t crc = m.entries[i].crc32;
-        tail[8]=(uint8_t)(crc>>24); tail[9]=(uint8_t)(crc>>16); tail[10]=(uint8_t)(crc>>8); tail[11]=(uint8_t)crc;
-        send(s, (char*)tail, 12, 0);
-    }
-    free(m.entries);
 }
 
 static void human_size(uint64_t b, char *out) {

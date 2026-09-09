@@ -23,6 +23,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <zlib.h>
+#include <signal.h>
 
 #define DEFAULT_PORT 5812
 #define OUTPUT_DIR   "received"
@@ -142,22 +143,23 @@ static uint32_t file_crc32(const char *path) {
     return crc;
 }
 
-typedef struct { MEntry *entries; int count; int cap; } ManifestBuf;
-
-static void me_add(ManifestBuf *m, const char *rel, uint64_t sz, uint32_t crc) {
-    if (m->count >= m->cap) {
-        int new_cap = m->cap ? m->cap*2 : 64;
-        MEntry *tmp = realloc(m->entries, (size_t)new_cap * sizeof(MEntry));
-        if (!tmp) return;
-        m->entries = tmp; m->cap = new_cap;
+/* Pass 1: count files only (no CRC32 — fast, just stat) */
+static uint32_t count_manifest(const char *dir) {
+    DIR *d = opendir(dir); if (!d) return 0;
+    struct dirent *de; uint32_t n = 0;
+    while ((de = readdir(d))) {
+        if (!strcmp(de->d_name,".") || !strcmp(de->d_name,"..")) continue;
+        char full[4096]; snprintf(full, sizeof(full), "%s/%s", dir, de->d_name);
+        struct stat st; if (stat(full, &st) < 0) continue;
+        if (S_ISDIR(st.st_mode)) n += count_manifest(full);
+        else if (S_ISREG(st.st_mode)) n++;
     }
-    strncpy(m->entries[m->count].path, rel, 1023); m->entries[m->count].path[1023] = '\0';
-    m->entries[m->count].size  = sz;
-    m->entries[m->count].crc32 = crc;
-    m->count++;
+    closedir(d);
+    return n;
 }
 
-static void manifest_walk(const char *dir, size_t root_len, ManifestBuf *m) {
+/* Pass 2: walk + CRC32 + send each entry immediately so data flows continuously */
+static void stream_manifest(int fd, const char *dir, size_t root_len) {
     DIR *d = opendir(dir); if (!d) return;
     struct dirent *de;
     while ((de = readdir(d))) {
@@ -165,45 +167,46 @@ static void manifest_walk(const char *dir, size_t root_len, ManifestBuf *m) {
         char full[4096]; snprintf(full, sizeof(full), "%s/%s", dir, de->d_name);
         struct stat st; if (stat(full, &st) < 0) continue;
         if (S_ISDIR(st.st_mode)) {
-            manifest_walk(full, root_len, m);
+            stream_manifest(fd, full, root_len);
         } else if (S_ISREG(st.st_mode)) {
             const char *rel = full + root_len; while (*rel == '/') rel++;
-            me_add(m, rel, (uint64_t)st.st_size, file_crc32(full));
+            uint32_t nl = (uint32_t)strlen(rel);
+            uint32_t crc = file_crc32(full);
+            uint8_t hdr[4];
+            hdr[0]=(uint8_t)(nl>>24); hdr[1]=(uint8_t)(nl>>16); hdr[2]=(uint8_t)(nl>>8); hdr[3]=(uint8_t)nl;
+            send(fd, hdr, 4, 0);
+            send(fd, rel, nl, 0);
+            uint8_t tail[12];
+            uint64_t sz = (uint64_t)st.st_size;
+            for (int j=7;j>=0;j--) { tail[j]=(uint8_t)(sz&0xFF); sz>>=8; }
+            tail[8]=(uint8_t)(crc>>24); tail[9]=(uint8_t)(crc>>16); tail[10]=(uint8_t)(crc>>8); tail[11]=(uint8_t)crc;
+            send(fd, tail, 12, 0);
         }
     }
     closedir(d);
 }
 
 static void send_manifest(int fd, const char *code_dir) {
-    ManifestBuf m = {NULL, 0, 0};
     struct stat st;
-    if (stat(code_dir, &st) == 0 && S_ISDIR(st.st_mode)) {
-        manifest_walk(code_dir, strlen(code_dir), &m);
+    if (stat(code_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        uint8_t cb[4] = {0,0,0,0}; send(fd, cb, 4, 0);
+        return;
+    }
+    uint32_t count = count_manifest(code_dir);
+    uint8_t cb[4];
+    cb[0]=(uint8_t)(count>>24); cb[1]=(uint8_t)(count>>16); cb[2]=(uint8_t)(count>>8); cb[3]=(uint8_t)count;
+    send(fd, cb, 4, 0);
+    if (count > 0) {
+        size_t root_len = strlen(code_dir);
+        stream_manifest(fd, code_dir, root_len);
         if (isatty(STDOUT_FILENO)) {
             pthread_mutex_lock(&g_log_mu);
             if (g_progress_line) { printf("\n"); g_progress_line = 0; }
-            printf("  Built manifest: %d files\n", m.count);
+            printf("  Sent manifest: %u files\n", count);
             fflush(stdout);
             pthread_mutex_unlock(&g_log_mu);
         }
     }
-    uint8_t cb[4];
-    cb[0]=(uint8_t)(m.count>>24); cb[1]=(uint8_t)(m.count>>16); cb[2]=(uint8_t)(m.count>>8); cb[3]=(uint8_t)m.count;
-    send(fd, cb, 4, 0);
-    for (int i = 0; i < m.count; i++) {
-        uint32_t nl = (uint32_t)strlen(m.entries[i].path);
-        uint8_t hdr[4];
-        hdr[0]=(uint8_t)(nl>>24); hdr[1]=(uint8_t)(nl>>16); hdr[2]=(uint8_t)(nl>>8); hdr[3]=(uint8_t)nl;
-        send(fd, hdr, 4, 0);
-        send(fd, m.entries[i].path, nl, 0);
-        uint8_t tail[12];
-        uint64_t sz = m.entries[i].size;
-        for (int j=7;j>=0;j--) { tail[j]=(uint8_t)(sz&0xFF); sz>>=8; }
-        uint32_t crc = m.entries[i].crc32;
-        tail[8]=(uint8_t)(crc>>24); tail[9]=(uint8_t)(crc>>16); tail[10]=(uint8_t)(crc>>8); tail[11]=(uint8_t)crc;
-        send(fd, tail, 12, 0);
-    }
-    free(m.entries);
 }
 
 static void human_size(uint64_t b, char *out) {
@@ -440,6 +443,7 @@ done:
 /* ── main ─────────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[]) {
+    signal(SIGPIPE, SIG_IGN); /* prevent server death when client disconnects mid-send */
     int port = argc > 1 ? atoi(argv[1]) : DEFAULT_PORT;
 
     mkdir(OUTPUT_DIR, 0755);
