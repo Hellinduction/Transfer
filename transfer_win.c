@@ -157,7 +157,7 @@ static void read_manifest(void) {
         g_manifest_n++;
     }
     if (g_manifest_n > 0)
-        printf("Server has %u file(s) — will skip CRC32 matches.\n", g_manifest_n);
+        printf("Server has %u file(s) — will skip unchanged files.\n", g_manifest_n);
 }
 
 static int manifest_has(const char *path, uint64_t size, uint32_t crc) {
@@ -236,6 +236,9 @@ static SOCKET connect_to_server(void) {
         fprintf(stderr, "Bad confirmation: 0x%02x\n", (unsigned char)confirm);
         closesocket(sock); return INVALID_SOCKET;
     }
+    /* server is alive — extend timeout for manifest (server hashes all files) */
+    DWORD tms_long = 300000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&tms_long, sizeof(tms_long));
     return sock;
 }
 
@@ -437,6 +440,8 @@ int main(int argc, char *argv[]) {
     if (g_sock == INVALID_SOCKET) { WSACleanup(); return 1; }
 
     read_manifest();
+    /* restore 30s timeout for file transfers */
+    { DWORD tms = 30000; setsockopt(g_sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&tms, sizeof(tms)); }
 
     /* send 0x02 metadata packet with total file count */
     {

@@ -170,7 +170,7 @@ static void read_manifest(void) {
         g_manifest_n++;
     }
     if (g_manifest_n > 0)
-        printf("Server has %u file(s) — will skip CRC32 matches.\n", g_manifest_n);
+        printf("Server has %u file(s) — will skip unchanged files.\n", g_manifest_n);
 }
 
 static int manifest_has(const char *path, uint64_t size, uint32_t crc) {
@@ -258,6 +258,9 @@ static int connect_to_server(void) {
         fprintf(stderr, "Bad confirmation: 0x%02x\n", (unsigned char)confirm);
         close(sock); return -1;
     }
+    /* server is alive — extend timeout for manifest (server hashes all files) */
+    struct timeval tv_long = { .tv_sec = 300, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv_long, sizeof(tv_long));
     return sock;
 }
 
@@ -270,7 +273,6 @@ static int send_file_data(const char *abs_path, const char *rel_path) {
         return 0; /* non-fatal: skip this file */
     }
 
-    /* check manifest — compute CRC32 first (file read once here, once for deflate) */
     if (g_manifest_n > 0) {
         uint32_t crc = file_crc32(abs_path);
         if (manifest_has(rel_path, (uint64_t)st.st_size, crc)) {
@@ -441,6 +443,9 @@ int main(int argc, char *argv[]) {
     if (g_sock < 0) return 1;
 
     read_manifest(); /* read skip-list from server before sending anything */
+    /* restore 30s timeout for file transfers */
+    { struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+      setsockopt(g_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); }
 
     /* send 0x02 metadata packet with total file count */
     {
